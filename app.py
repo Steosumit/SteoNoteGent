@@ -10,22 +10,26 @@ This module serves to integrate the LLM with the tools and initiate the main app
 from typing import TypedDict, Annotated, Sequence
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.output_parsers import JsonOutputParser
 from langgraph.prebuilt import ToolNode  # imp shortcut to make the tool node
 from langgraph.graph import StateGraph, START, END
 from retriever import CustomRetriever  # custom import I made be cautious
-from tools import CustomRetrieverTool, web_search_tool
+from tools import CustomRetrieverTool, web_search_tool  # custom tools made
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-
-# Initialize retriever (do this once at startup)
+# Initialization code
+## Initialize retriever (do this once at startup)
 print("[INIT] Initializing retriever...")
 retriever_instance = CustomRetriever("sample_data.csv")  # sample file for testing
 vector_retriever = retriever_instance.run()
 print("[INIT] Retriever ready.")
 retriever_tool = CustomRetrieverTool(retriever=vector_retriever)
+## Initialize the parser
+parser = JsonOutputParser()
+print("[INIT] Output parser ready.")
 
 # LLM
-llm_instance = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+llm_instance = ChatGoogleGenerativeAI(model="models/gemini-flash-latest", temperature=0)
 tools = [retriever_tool, web_search_tool]
 llm_instance = llm_instance.bind_tools(tools)  # tool binded llm ready
 print("[INIT] Tool binded LLM ready.")
@@ -43,22 +47,41 @@ def llm(state: AgentState) -> AgentState:
     You have access to these following tools:
     1. retriever_tool: to retrieve the most relevant information about Sumit's notes.
     2. web_search_tool: to search the internet for more information.
-    Strictly use the following format to think:
+    Strictly use the following WORKFLOW CYCLE to think:
     Question: <the input query>
-    Thought: always try to find the best context about the queries from the user notes
-    Action: decide if I need to find information from the notes(yes/no), if yes call the tools with the query
-    Observation: the result of the tool calls 
+    Thought: always try to find the best context about the user query, ask follow up questions if needed, decide if I need to use tools
+    Action: user tools if needed
+    Observation: analyze the output of the tools 
     Thought: based on the observation, decide if you need to repeat or give the final answer
     Action: Give final answer or repeat the Thought, Action, Observation loop
     
-    Always provide the final answer in the following format:
-    Final Answer: <greetings> <final answer to the query>
+    How to give the final answer?
+    Strictly use the JSON format:
+    {{
+    "Final Answer": "<greetings> <final answer to the query>"
+    "confidence": "<high/medium/low>"
+    }}
+    Example use case to give final answer:
+    {{
+        "Final Answer": "Hello Steo! According to your notes, you were doing 'Gym session' at 6 PM.",
+        "confidence": "high"
+    }}
     
-    Now begin! Remember to provide the final answer in the specified format.
+    Now begin! Remember to follow the WORKFLOW CYCLE and use the JSON format for the final answer.
     """
 
     message = state["messages"]
     response = llm_instance.invoke([SystemMessage(content=sys_prompt)] + list(message))
+    # Poor performance code need improvement later
+    # parse json if final answer
+    # Only parse if it's the final answer (no tool calls)
+    if not hasattr(response, "tool_calls") or not response.tool_calls:
+        try:
+            parsed = parser.parse(response.content)
+            if "Final Answer" in parsed:
+                return {"messages": [AIMessage(content=str(parsed))]}
+        except Exception:
+            pass  # Not JSON yet, continue workflow
     return {"messages": [response]}
 
 def should_continue(state: AgentState) -> bool:
@@ -71,7 +94,7 @@ def should_continue(state: AgentState) -> bool:
 # StateGraph
 
 graph = StateGraph(AgentState)
-graph.add_node("llm_node", llm_instance)
+graph.add_node("llm_node", llm)
 
 # graph.add_node("should_continue_node", should_continue) (not needed check)
 tool_node = ToolNode(tools=tools)
@@ -89,3 +112,6 @@ graph.add_conditional_edges(
 graph.add_edge("tool_node", "llm_node")  # reconnection
 app = graph.compile()
 
+# test
+response = app.invoke({"messages": [HumanMessage(content="At what time I was doing 'Gym session' according to my notes ")]})
+print("\n\nFinal Response from Agent:\n", response["messages"][-1].content[0]['text'])
